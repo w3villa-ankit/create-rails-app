@@ -1,0 +1,563 @@
+#!/bin/bash
+# TODO:
+# Need wrapper functions for:
+#   replaces matched line with given string
+#   prepend string to all lines
+#   add line after matched line
+#   add line before matched line
+#   simple replacement with sed
+
+RAILS_VERSION="7-0-stable"
+BOOTSTRAP_VERSION="5.1"
+
+
+
+download() {
+  (git clone -b 7-0-stable --single-branch https://github.com/rails/rails /tmp/rails) || true
+}
+
+generate() {
+  pushd /tmp/rails
+  bundle install
+  bundle exec railties/exe/rails new /tmp/created-rails-app --dev --database=postgresql --javascript=esbuild --css=bootstrap
+  cd /tmp/created-rails-app
+
+  # this is a one time thing
+  if [ "$(uname)" == "Darwin" ]; then
+    true # dp nothing on macos
+  else
+    git config --global init.defaultBranch main
+    git config --global user.email "example@example.com"
+    git config --global user.name "Sam Bot"
+  fi
+
+  commit "Generated new rails application"
+  popd
+}
+
+# repoint gemfile to github rails/rails
+repoint() {
+  pushd /tmp/created-rails-app
+  replace_line 'gem "rails' "gem 'rails', :github => 'rails/rails', :branch => '"$RAILS_VERSION"'" Gemfile
+  rm Gemfile.lock
+  bundle install
+  bundle lock --add-platform ruby # is this needed nowadays?
+  remove_line_containing_word "Use local checkout of Rails" Gemfile
+  ./bin/setup
+  commit "Using rails branch at github"
+  popd
+}
+
+randomize_name() {
+  pushd /tmp/created-rails-app
+  npm install --global haikunator-cli
+  name=$(haikunator | cut -f 2 -d '-')
+  name2=$(echo $name | perl -nle 'print uc')
+  name3=$(echo $name | perl -nle 'print ucfirst lc')
+  echo "Names: $name $name2 $name2"
+  # replace_string 'CreatedRailsApp' $name3 config/application.rb
+  perl -p -i -e 's/CreatedRailsApp/'$name3'/g' config/application.rb
+  perl -p -i -e 's/CreatedRailsApp/'$name3'/g' app/views/layouts/application.html.erb
+  perl -p -i -e 's/created_rails_app/'$name'/g' config/*.yml
+  perl -p -i -e 's/CREATED_RAILS_APP/'$name2'/g' config/*.yml
+  perl -p -i -e 's/created_rails_app/'$name'/g' config/environments/*.rb
+  commit "Using unique name for rails application"
+  popd
+}
+
+# setup redis
+redis() {
+  pushd /tmp/created-rails-app
+  bundle add redis --git "https://github.com/redis/redis-rb" --branch "master" &>/dev/null
+  insert_before_last_line 'config.cache_store = :redis_cache_store, { url: ENV.fetch("REDIS_URL", "redis://localhost:6379/0") }' config/environments/production.rb
+  commit "Setup redis"
+  popd
+}
+
+# using newer version of turbo-rails
+hotwired() {
+  pushd /tmp/created-rails-app
+  replace_line 'gem "turbo-rails' "gem 'turbo-rails', :github => 'hotwired/turbo-rails', :branch => 'main'" Gemfile
+  bundle install
+  commit "Hotwire setup"
+  popd
+}
+
+# adds devise gem
+devise() {
+  pushd /tmp/created-rails-app
+  bundle add devise --git "https://github.com/heartcombo/devise" --branch "main" &>/dev/null
+  bundle install &>/dev/null
+  ./bin/rails generate devise:install
+  ./bin/rails generate devise User
+  insert_as_first_line '# frozen_string_literal: true\n' app/models/user.rb
+  ./bin/rails db:migrate
+  prepend_all_lines '# ' test/fixtures/users.yml
+  insert_line_after 'class ActiveSupport' '  include Devise::Test::IntegrationHelpers' test/test_helper.rb
+  commit "Installed devise"
+  popd
+}
+
+# adds pundit for authorization
+pundit() {
+  pushd /tmp/created-rails-app
+  bundle add pundit --git "https://github.com/varvet/pundit" --branch "main" &>/dev/null  
+  bundle install &>/dev/null
+  # TODO:
+  # ...Include Pundit::Authorization in your application controller:
+  #   class ApplicationController < ActionController::Base
+  #     include Pundit::Authorization
+  #   end
+
+  ./bin/rails g pundit:install
+  insert_line_after 'class ApplicationController' '  include Pundit::Authorization' app/controllers/application_controller.rb
+  mv app/policies/application_policy.rb  app/policies/application_policy.rb.txt
+  # so coverage metric is not affected
+  commit "Install pundit"
+  popd
+}
+
+
+activejob() {
+  pushd /tmp/created-rails-app
+  bundle add sidekiq
+  cp ~/work/create-rails-app/create-rails-app/templates/config/initializers/sidekiq.rb config/initializers/
+  insert_before_last_line 'config.active_job.queue_adapter     = :sidekiq' config/environments/development.rb
+  insert_before_last_line 'config.active_job.queue_adapter     = :sidekiq' config/environments/production.rb
+  insert_file_before_last_line ~/work/create-rails-app/create-rails-app/templates/config/routes_sidekiq.rb config/routes.rb
+  commit "Setup activejob"
+  popd
+}
+
+# Some extra setup useful for production running of activestorage
+activestorage() {
+  pushd /tmp/created-rails-app
+  echo 'gem "aws-sdk-s3", require: false' >> Gemfile
+  bundle install &>/dev/null
+  commit "Setup activestorage"
+  popd
+}
+
+#
+#
+#
+#
+#
+# stopped audit here
+# some widgets still expect jquery in the window. namespace
+jquery() {
+  pushd /tmp/created-rails-app
+  (cd /tmp;
+    curl -s -O https://code.jquery.com/jquery-3.6.0.min.js)
+  cp /tmp/jquery-3.6.0.min.js public/
+  echo '<script src="/jquery-3.6.0.min.js"></script>' >> app/views/_javascripts.html.erb
+  insert_line_after 'javascript_include_tag' '   <%= render "/javascripts" %>' app/views/layouts/application.html.erb
+  insert_line_after 'stylesheet_link_tag' "    <%= render '/stylesheets' %>" app/views/layouts/application.html.erb
+  touch app/views/_stylesheets.html.erb
+  commit "Installed jquery"
+  popd
+}
+
+bootstrap() {
+  pushd /tmp/created-rails-app
+  # Download and compile bootstrap
+  (cd /tmp/
+    (git clone git@github.com:twbs/bootstrap.git || true)
+    cd /tmp/bootstrap
+    npm install &>/dev/null
+    npm run dist &>/dev/null)
+  cp /tmp/bootstrap/dist/css/bootstrap.css* public/
+  echo '<link rel="stylesheet" href="/bootstrap.css">' >> app/views/_stylesheets.html.erb
+  cp /tmp/bootstrap/dist/js/bootstrap.bundle.js* public/
+  echo '<script src="/bootstrap.bundle.js"></script>' >> app/views/_javascripts.html.erb
+  prepend_all_lines '\/\/ ' app/assets/stylesheets/application.bootstrap.scss
+  echo "// instead using bootstrap at app/views/_javascripts" >> app/assets/stylesheets/application.bootstrap.scss
+  replace_line 'import \* as bootstrap' '// import * as bootstrap from "bootstrap"' app/javascript/application.js
+  commit "Installed bootstrap"
+  popd
+}
+
+bootstrap_icons() {
+  pushd /tmp/created-rails-app
+  (cd /tmp/
+   curl -s -L -O https://github.com/twbs/icons/archive/refs/heads/main.zip
+   myunzip main.zip &>/dev/null)
+  cp /tmp/icons-main/font/bootstrap-icons.css public/
+  mkdir public/fonts
+  cp /tmp/icons-main/font/fonts/* public/fonts/
+  echo '<link rel="stylesheet" href="/bootstrap-icons.css">' >> app/views/_stylesheets.html.erb
+  commit "Installed bootstrap icons"
+  popd
+}
+
+fontawesome() {
+  pushd /tmp/created-rails-app
+  (cd /tmp/
+   curl -s -L -O https://github.com/FortAwesome/Font-Awesome/archive/refs/heads/6.x.zip
+   myunzip 6.x.zip &>/dev/null)
+  mkdir -p public/Font-Awesome/css
+  mkdir -p public/Font-Awesome/webfonts
+  cp /tmp/Font-Awesome-6.x/css/all.css public/Font-Awesome/css/
+  cp /tmp/Font-Awesome-6.x/webfonts/* public/Font-Awesome/webfonts/
+  echo '<link rel="stylesheet" href="/Font-Awesome/css/all.css">' >> app/views/_stylesheets.html.erb
+  commit "Installed fontawesome"
+  popd
+}
+
+# install flatpickr - lightweight and powerful datetime picker.
+flatpickr() {
+  pushd /tmp/created-rails-app
+  (cd public
+     curl -s -L -O https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css
+     curl -s -L -O https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.js)
+  echo '<link rel="stylesheet" href="/flatpickr.min.css">' >> app/views/_stylesheets.html.erb
+  echo '<script src="/flatpickr.min.js"></script>' >> app/views/_javascripts.html.erb
+  commit "Installed flatpickr"
+  popd
+}
+
+
+nice_partials() {
+  pushd /tmp/created-rails-app
+  bundle add nice_partials --git "https://github.com/bullet-train-co/nice_partials" --branch "main" &>/dev/null
+  commit "Installed nice_partials"
+  popd
+}
+
+# a pagination gem
+kaminari() {
+  pushd /tmp/created-rails-app
+  bundle add kaminari --git "https://github.com/kaminari/kaminari" --branch "master" &>/dev/null
+  commit "Installed kaminari"
+  popd
+}
+
+# Basic setup for rails flash messages
+flash() {
+  pushd /tmp/created-rails-app
+  cp ~/work/create-rails-app/create-rails-app/templates/app/views/_flashes.html.erb app/views/
+  cp ~/work/create-rails-app/create-rails-app/templates/app/javascript/controllers/fade_out_controller.js app/javascript/controllers/
+  insert_line_after '<body' '    <%= render "/flashes" %>' app/views/layouts/application.html.erb
+  commit "Setup flash messages"
+  popd
+}
+
+# some extra styles
+stylesheets() {
+  pushd /tmp/created-rails-app
+  cp ~/work/create-rails-app/create-rails-app/templates/app/assets/stylesheets/debug.css app/assets/stylesheets/
+  echo "@import 'debug';" >> app/assets/stylesheets/application.bootstrap.scss
+  commit "Added some extra css"
+  popd
+}
+
+constants() {
+  pushd /tmp/created-rails-app
+  cp ~/work/create-rails-app/create-rails-app/templates/config/constants.rb config/
+  echo 'require Rails.root.join("config/constants")' >> config/application.rb
+  commit "Simple constant overriding mechanism"
+  popd
+}
+
+# Prefer factories over fixtures
+factory_bot() { 
+  pushd /tmp/created-rails-app
+  bundle add factory_bot_rails --git "https://github.com/thoughtbot/factory_bot_rails" --group "test,development" --branch "main" &>/dev/null
+  bundle add faker --git "https://github.com/faker-ruby/faker" --branch "master" &>/dev/null
+  mkdir test/factories
+  insert_line_after 'class ActiveSupport' '  include FactoryBot::Syntax::Methods' test/test_helper.rb
+  commit "Installed factory_bot"
+  popd
+}
+
+# tweaks related to test framework
+testing() {
+  pushd /tmp/created-rails-app
+  # a custom script for autotesting
+  cp ~/work/create-rails-app/create-rails-app/templates/bin/autotest bin/
+  chmod +x ./bin/autotest
+  # parallelize not used atm
+  replace_string 'parallelize' "\x23\x20parallelize" test/test_helper.rb # using escapes to avoid 'not terminated' error
+  commit "Setup test framework"
+  popd
+}
+
+# should output: Coverage report generated ... 1328 / 1328 LOC (100.0%) covered.
+# when you do COVERAGE=1 ./bin/rails test
+simplecov() {
+  pushd /tmp/created-rails-app
+  echo "gem 'simplecov', require: false, group: :test" >> Gemfile
+  bundle install &>/dev/null
+  echo "coverage" >> .gitignore
+  cat ~/work/create-rails-app/create-rails-app/templates/test/test_helper.rb.tt test/test_helper.rb > /tmp/file3
+  mv /tmp/file3 test/test_helper.rb
+  mkdir test/support || true
+  cp ~/work/create-rails-app/create-rails-app/templates/test/support/00_simplecov.rb test/support/
+  string='Dir[File.expand_path('\''support/**/*.rb'\'', __dir__)].sort.each { |rb| require(rb) }'
+  mysed -i "/class ActiveSupport.*/i $string" test/test_helper.rb
+  # ^ add line before matched line
+  mysed -i -r 's/(class ActiveSupport::TestCase)/\n\1/g' test/test_helper.rb
+  # ^ adds a newline before matched line
+  # adding minitest-test_profile gem
+  bundle add minitest-test_profile --git "https://github.com/y-yagi/minitest-test_profile" --group "test" --branch "master" &>/dev/null
+  cp ~/work/create-rails-app/create-rails-app/templates/test/support/minitest-test_profile.rb test/support/
+
+  commit "Installed simplecov"
+  popd
+}
+
+# Prevent test suite making outgoing network connections
+# with the message: WebMock::NetConnectNotAllowedError: Real HTTP connections are disabled
+webmock() {
+  pushd /tmp/created-rails-app
+  bundle add webmock --git "https://github.com/bblimke/webmock" --group "test" --branch "master" &>/dev/null
+  cp ~/work/create-rails-app/create-rails-app/templates/test/support/webmock.rb test/support/
+  commit "Use webmock for http requests"
+  popd
+}
+
+# sometimes you want to vcr instead of webmock
+vcr() {
+  pushd /tmp/created-rails-app
+  bundle add vcr --git "https://github.com/vcr/vcr" --group "test" --branch "master" &>/dev/null
+  cp ~/work/create-rails-app/create-rails-app/templates/test/support/vcr.rb test/support/
+  commit "Installed vcr"
+  popd
+}
+
+# cron like scheduling
+scheduler() {
+  pushd /tmp/created-rails-app
+  bundle add sidekiq-cron --git "https://github.com/ondrejbartas/sidekiq-cron" --branch "master" &>/dev/null
+  cp ~/work/create-rails-app/create-rails-app/templates/config/initializers/sidekiq_cron.rb config/initializers/
+  commit "Installed sidekiq-cron"
+  popd
+}
+
+# using sengrid for email
+sendgrid() {
+  pushd /tmp/created-rails-app
+  bundle add sendgrid-ruby --optimistic &>/dev/null
+  commit "Install sendgrid"
+  popd
+}
+
+# ruby gem for error monitoring
+airbrake() {
+  pushd /tmp/created-rails-app
+  bundle add airbrake --git "https://github.com/airbrake/airbrake" --branch "master" &>/dev/null
+  ./bin/rails g airbrake
+  commit "Install airbrake"
+  popd
+}
+
+# Adds a procfile - heroku uses this
+procfile() {
+  pushd /tmp/created-rails-app
+  cp ~/work/create-rails-app/create-rails-app/templates/Procfile.tt Procfile
+  commit "Added Procfile"
+  popd
+}
+
+# new code often comes to the experiment class first
+experiment() {
+  pushd /tmp/created-rails-app
+  cp ~/work/create-rails-app/create-rails-app/templates/test/models/experiment_test.rb test/models/
+  cp ~/work/create-rails-app/create-rails-app/templates/app/models/experiment.rb app/models/
+  commit "Added experiment class"
+  popd
+}
+
+# generates soe scaffolds to serve as examples
+example() {
+  pushd /tmp/created-rails-app
+  ./bin/rails generate scaffold Example title:string body:text seed:boolean
+  mysed -i 's/examples(:one)/FactoryBot.create(:example)/' test/controllers/examples_controller_test.rb
+  # ^ simple replacement with sed
+  ./bin/rails db:migrate
+  ./bin/rails g factory_bot:model Example title:string body:text seed:boolean
+  echo 'Example.where(seed: true).destroy_all' >> db/seeds.rb
+  echo '10.times { FactoryBot.create(:example, seed: true) }' >> db/seeds.rb
+  commit "Generated some code to serve as examples"
+  popd
+}
+
+# react/jsx/tsx via esbuild
+react() {
+  pushd /tmp/created-rails-app
+  yarn add react react-dom
+  mkdir app/javascript/components
+  cp ~/work/create-rails-app/create-rails-app/templates/hello.tsx app/javascript/components/
+  echo 'import "./components/hello"' >> app/javascript/application.js
+  commit "React setup"
+  popd
+}
+
+# Setup a vue component
+vue() {
+  pushd /tmp/created-rails-app
+  yarn add vue
+  cp ~/work/create-rails-app/create-rails-app/templates/hellovue.js app/javascript/components/
+  echo 'import "./components/hellovue"' >> app/javascript/application.js
+  echo '<div id="hello-vue-mount-point"></div>' >> app/views/examples/index.html.erb
+  commit "Setup a vue component"
+  popd
+}
+
+# sets up automated testing (ci) via github actions
+ci() {
+  pushd /tmp/created-rails-app
+  mkdir -p .github/workflows/
+  cp ~/work/create-rails-app/create-rails-app/templates/.github/workflows/verify.yml .github/workflows/
+  # RUBOCOP
+  cp ~/work/create-rails-app/create-rails-app/templates/.rubocop.yml.tt .rubocop.yml
+  cp ~/work/create-rails-app/create-rails-app/templates/.rubocop_todo.yml.tt .rubocop_todo.yml
+  # rubocop --auto-gen-config
+  rubocop --regenerate-todo app/
+  # REEK
+  gem install reek
+  cp ~/work/create-rails-app/create-rails-app/templates/.reek.yml.tt .reek.yml
+  # ^ some "sensible" reek ignores for rails
+  commit "Set up ci"
+  popd
+}
+
+
+readme() {
+  pushd /tmp/created-rails-app
+  cp ~/work/create-rails-app/create-rails-app/templates/README.md.tt README.md
+  commit "Added README"
+  popd
+}
+
+# some additional gitignores
+gitignore() {
+  pushd /tmp/created-rails-app
+  echo ".envrc" >> .gitignore
+  echo "**/.DS_Store" >> .gitignore
+  commit "Updated .gitignore"
+  popd
+}
+
+upload() {
+  pushd /tmp/created-rails-app
+  if [ "$(uname)" == "Darwin" ]; then
+    echo "not uploading on Darwin"
+  else
+    git remote add myremote git@github.com:la-ruby/created-rails-app.git
+    git checkout -b latest
+    git push -f myremote latest
+    git checkout main
+
+    git clone git@github.com:la-ruby/created-rails-app.git /tmp/downloaded-rails-app
+    cd /tmp/downloaded-rails-app/
+    find -not -path "./.git/*" -not -name ".git" -delete
+    rsync --stats -aP --exclude='.git/' --exclude='node_modules/*' /tmp/created-rails-app/ /tmp/downloaded-rails-app/ &>/dev/null
+
+    git add --all
+    git commit -m "Updates for $(date +%D)"
+    git push origin main
+  fi
+  popd
+}
+
+commit() {
+  git add --all &>/dev/null
+  git commit -m "$1" &>/dev/null
+}
+
+mysed () {
+  case $(uname -s) in
+    *[Dd]arwin* | *BSD* ) gsed "$@";;
+    *) sed -i "$@";;
+  esac
+}
+
+# TODO: is this needed?
+myunzip () {
+  case $(uname -s) in
+    *[Dd]arwin* | *BSD* ) unzip "$@";;
+    *) unzip "$@";;
+  esac
+}
+
+replace_line() {
+  mysed -i "/^$1/c\REMOVED" $3 # replaces matched line with given string
+  mysed -i "/^REMOVED/c\\$2" $3 # replaces matched line with given string
+}
+
+replace_string() {
+  perl -p -i -e 's/'$1'/'$2'/g' $3
+}
+
+prepend_all_lines() {
+  mysed -i -e "s/^/$1/" $2 # prepend string to all lines
+}
+
+# add line after matched line
+insert_line_after() {
+  perl -s -p -i -e '$_.="$bbb\n" if /$aaa/' -- -aaa="$1" -bbb="$2" $3
+}
+
+# TODO: make two spaces optional
+insert_before_last_line() {
+  mysed -i '$i\
+  '"$1" $2
+}
+
+insert_file_before_last_line() {
+  mysed -i '$ d' $2 # remove last line from file
+  cat $1 >> $2
+  echo "end" >> $2
+}
+
+insert_as_first_line() {
+  awk -v TEXT="$1" 'BEGIN {print TEXT};1' $2
+}
+
+remove_line_containing_word() {
+  gawk -i inplace '!'"/$1/" $2
+}
+
+
+main() {
+  download
+  generate
+  randomize_name
+  repoint
+  redis
+  hotwired
+  devise
+  pundit
+  activejob
+  activestorage
+  jquery
+  bootstrap
+  bootstrap_icons
+  fontawesome
+  flatpickr
+  nice_partials
+  kaminari
+  flash
+  stylesheets
+  constants
+  factory_bot
+  testing
+  simplecov
+  webmock
+  vcr
+  scheduler
+  sendgrid
+  airbrake
+  procfile
+  experiment
+  example
+  react
+  vue
+  ci
+  readme
+  gitignore
+  upload
+}
+echo hello
+main
