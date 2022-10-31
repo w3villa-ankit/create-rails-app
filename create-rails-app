@@ -444,7 +444,7 @@ upload() {
   if [ "$(uname)" == "Darwin" ]; then
     echo "not uploading on Darwin"
   else
-    git remote add myremote git@github.com:la-ruby/created-rails-app.git
+    git remote add origin git@github.com:w3villa-ankit/final-create-rails-app.git
     git checkout -b latest
     git push -f myremote latest
     git checkout main
